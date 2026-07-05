@@ -49,6 +49,11 @@ jobs:
           distribution: temurin
           java-version: "21"
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: Start Axtolix Host
         shell: bash
         run: |
@@ -59,7 +64,11 @@ jobs:
           echo "======================================"
 
           sudo apt-get update -y
-          sudo apt-get install -y jq curl docker.io
+          sudo apt-get install -y jq curl
+
+          echo "Prüfe Docker..."
+          docker --version
+          sudo systemctl start docker || true
 
           export PANEL_PASSWORD="$(openssl rand -base64 12 | tr -d '=+/')"
           echo "PANEL_PASSWORD=$PANEL_PASSWORD" >> "$GITHUB_ENV"
@@ -548,10 +557,10 @@ jobs:
           sleep 8
 
           echo "Starte bore TCP-Tunnel fürs Panel..."
-          nohup docker run --rm --network host ekzhang/bore local "$PANEL_PORT" --to bore.pub > panel_bore.log 2>&1 &
+          nohup docker run --pull always --rm --network host ekzhang/bore local "$PANEL_PORT" --to bore.pub > panel_bore.log 2>&1 &
 
           echo "Starte bore TCP-Tunnel für Minecraft..."
-          nohup docker run --rm --network host ekzhang/bore local "$MC_PORT" --to bore.pub > mc_bore.log 2>&1 &
+          nohup docker run --pull always --rm --network host ekzhang/bore local "$MC_PORT" --to bore.pub > mc_bore.log 2>&1 &
 
           echo "Warte auf öffentliche Tunnel-Adressen..."
 
