@@ -1,0 +1,598 @@
+name: Axtolix Host
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_name:
+        description: "Servername"
+        required: true
+        default: "Axtolix Free Server"
+      mc_version:
+        description: "Minecraft/Paper Version, z.B. 1.21.4 oder latest"
+        required: true
+        default: "latest"
+      max_players:
+        description: "Max Spieler"
+        required: true
+        default: "10"
+      operator_name:
+        description: "Minecraft Name vom Admin/OP"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: axtolix-host
+  cancel-in-progress: true
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      RAM_MB: "1024"
+      PANEL_PORT: "8080"
+      MC_PORT: "25565"
+      PANEL_USER: "admin"
+      SERVER_NAME: ${{ github.event.inputs.server_name }}
+      MC_VERSION_INPUT: ${{ github.event.inputs.mc_version }}
+      MAX_PLAYERS: ${{ github.event.inputs.max_players }}
+      OPERATOR_NAME: ${{ github.event.inputs.operator_name }}
+
+    steps:
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Start Axtolix Host
+        shell: bash
+        run: |
+          set -e
+
+          echo "======================================"
+          echo "        AXTOLIX HOST STARTET"
+          echo "======================================"
+
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl docker.io
+
+          export PANEL_PASSWORD="$(openssl rand -base64 12 | tr -d '=+/')"
+          echo "PANEL_PASSWORD=$PANEL_PASSWORD" >> "$GITHUB_ENV"
+
+          mkdir -p mc panel
+
+          echo "Lade PaperMC..."
+
+          if [ "$MC_VERSION_INPUT" = "latest" ]; then
+            MC_VERSION="$(curl -fsSL https://api.papermc.io/v2/projects/paper | jq -r '.versions[-1]')"
+          else
+            MC_VERSION="$MC_VERSION_INPUT"
+          fi
+
+          BUILD="$(curl -fsSL "https://api.papermc.io/v2/projects/paper/versions/${MC_VERSION}" | jq -r '.builds[-1]')"
+
+          if [ "$BUILD" = "null" ] || [ -z "$BUILD" ]; then
+            echo "Version $MC_VERSION nicht gefunden. Fallback auf aktuelle Paper-Version."
+            MC_VERSION="$(curl -fsSL https://api.papermc.io/v2/projects/paper | jq -r '.versions[-1]')"
+            BUILD="$(curl -fsSL "https://api.papermc.io/v2/projects/paper/versions/${MC_VERSION}" | jq -r '.builds[-1]')"
+          fi
+
+          JAR="paper-${MC_VERSION}-${BUILD}.jar"
+          curl -fL -o mc/paper.jar "https://api.papermc.io/v2/projects/paper/versions/${MC_VERSION}/builds/${BUILD}/downloads/${JAR}"
+
+          cat > mc/eula.txt <<'EOF'
+          eula=true
+          EOF
+
+          cat > mc/server.properties <<EOF
+          server-port=${MC_PORT}
+          motd=§b§lAxtolix Host §7- Free 1GB Server
+          max-players=${MAX_PLAYERS}
+          online-mode=true
+          difficulty=easy
+          gamemode=survival
+          pvp=true
+          spawn-protection=0
+          view-distance=6
+          simulation-distance=4
+          enable-command-block=true
+          enable-rcon=false
+          allow-flight=false
+          EOF
+
+          cat > panel/server.js <<'NODE'
+          const http = require("http");
+          const fs = require("fs");
+          const path = require("path");
+          const { spawn } = require("child_process");
+
+          const PANEL_PORT = Number(process.env.PANEL_PORT || 8080);
+          const MC_DIR = path.join(process.cwd(), "mc");
+          const RAM_MB = process.env.RAM_MB || "1024";
+          const USER = process.env.PANEL_USER || "admin";
+          const PASS = process.env.PANEL_PASSWORD || "admin";
+          const SERVER_NAME = process.env.SERVER_NAME || "Axtolix Free Server";
+          const MAX_PLAYERS = process.env.MAX_PLAYERS || "10";
+          const OPERATOR_NAME = process.env.OPERATOR_NAME || "";
+
+          let mc = null;
+          let status = "stopped";
+          let logs = [];
+          let lastExit = null;
+
+          function addLog(line) {
+            const text = `[${new Date().toLocaleTimeString()}] ${line}`;
+            logs.push(text);
+            if (logs.length > 700) logs.shift();
+            console.log(text);
+          }
+
+          function readPublicAddress(file) {
+            try {
+              if (fs.existsSync(file)) return fs.readFileSync(file, "utf8").trim();
+            } catch {}
+            return "wird gleich in den GitHub-Actions-Logs angezeigt";
+          }
+
+          function getPanelAddress() {
+            const addr = readPublicAddress("panel_address.txt");
+            if (addr.startsWith("bore.pub:")) return "http://" + addr;
+            return addr;
+          }
+
+          function getMcAddress() {
+            return readPublicAddress("mc_address.txt");
+          }
+
+          function startMinecraft() {
+            if (mc && !mc.killed) return false;
+
+            addLog("Starte Minecraft Server mit " + RAM_MB + " MB RAM...");
+            status = "starting";
+
+            mc = spawn("java", [
+              "-Xms512M",
+              `-Xmx${RAM_MB}M`,
+              "-jar",
+              "paper.jar",
+              "nogui"
+            ], {
+              cwd: MC_DIR,
+              stdio: ["pipe", "pipe", "pipe"]
+            });
+
+            mc.stdout.on("data", d => {
+              d.toString().split(/\r?\n/).filter(Boolean).forEach(line => {
+                addLog(line);
+                if (line.includes("Done")) {
+                  status = "online";
+
+                  if (OPERATOR_NAME && OPERATOR_NAME.trim().length > 0) {
+                    try {
+                      mc.stdin.write("op " + OPERATOR_NAME.trim() + "\n");
+                      addLog("OP gesetzt für: " + OPERATOR_NAME.trim());
+                    } catch {}
+                  }
+                }
+              });
+            });
+
+            mc.stderr.on("data", d => {
+              d.toString().split(/\r?\n/).filter(Boolean).forEach(line => {
+                addLog("[ERR] " + line);
+              });
+            });
+
+            mc.on("exit", code => {
+              lastExit = code;
+              status = "stopped";
+              addLog("Minecraft Server beendet. Code: " + code);
+              mc = null;
+            });
+
+            return true;
+          }
+
+          function stopMinecraft() {
+            if (!mc) return false;
+
+            addLog("Stoppe Minecraft Server...");
+            status = "stopping";
+
+            try {
+              mc.stdin.write("stop\n");
+              setTimeout(() => {
+                if (mc && !mc.killed) mc.kill("SIGTERM");
+              }, 12000);
+            } catch {
+              try { mc.kill("SIGTERM"); } catch {}
+            }
+
+            return true;
+          }
+
+          function restartMinecraft() {
+            stopMinecraft();
+            setTimeout(startMinecraft, 15000);
+          }
+
+          function sendCommand(cmd) {
+            if (!mc) return false;
+            mc.stdin.write(cmd + "\n");
+            addLog("> " + cmd);
+            return true;
+          }
+
+          function auth(req, res) {
+            const header = req.headers.authorization || "";
+            const expected = "Basic " + Buffer.from(USER + ":" + PASS).toString("base64");
+
+            if (header !== expected) {
+              res.writeHead(401, {
+                "WWW-Authenticate": 'Basic realm="Axtolix Host Panel"',
+                "Content-Type": "text/plain"
+              });
+              res.end("Login erforderlich");
+              return false;
+            }
+
+            return true;
+          }
+
+          function body(req) {
+            return new Promise(resolve => {
+              let data = "";
+              req.on("data", chunk => data += chunk);
+              req.on("end", () => resolve(data));
+            });
+          }
+
+          function json(res, obj) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(obj));
+          }
+
+          function page() {
+            const panelAddress = getPanelAddress();
+            const mcAddress = getMcAddress();
+
+            return `<!doctype html>
+          <html lang="de">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width,initial-scale=1">
+            <title>Axtolix Host</title>
+            <style>
+              body {
+                margin: 0;
+                font-family: Arial, sans-serif;
+                background:
+                  radial-gradient(circle at top left, rgba(0,212,255,.25), transparent 35%),
+                  radial-gradient(circle at top right, rgba(168,85,247,.25), transparent 35%),
+                  linear-gradient(135deg, #020617, #0f172a 55%, #111827);
+                color: white;
+              }
+
+              header {
+                padding: 34px 20px;
+                text-align: center;
+                background: rgba(0,0,0,.25);
+                border-bottom: 1px solid rgba(255,255,255,.12);
+              }
+
+              h1 {
+                margin: 0;
+                font-size: 46px;
+                color: #67e8f9;
+                text-shadow: 0 0 24px #0891b2;
+              }
+
+              .sub {
+                margin-top: 10px;
+                color: #c4b5fd;
+                font-size: 18px;
+              }
+
+              .wrap {
+                max-width: 1150px;
+                margin: 24px auto;
+                padding: 0 16px 40px;
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 18px;
+              }
+
+              .card {
+                background: rgba(15,23,42,.9);
+                border: 1px solid rgba(255,255,255,.13);
+                border-radius: 20px;
+                padding: 20px;
+                box-shadow: 0 18px 50px rgba(0,0,0,.4);
+              }
+
+              .big {
+                grid-column: 1 / -1;
+              }
+
+              .pill {
+                display: inline-block;
+                padding: 8px 14px;
+                border-radius: 999px;
+                background: #020617;
+                color: #93c5fd;
+                border: 1px solid #334155;
+                font-weight: bold;
+              }
+
+              button {
+                border: 0;
+                border-radius: 12px;
+                padding: 12px 16px;
+                margin: 6px 4px 6px 0;
+                color: white;
+                background: #0ea5e9;
+                font-weight: bold;
+                cursor: pointer;
+              }
+
+              button:hover {
+                filter: brightness(1.15);
+              }
+
+              button.ok {
+                background: #22c55e;
+              }
+
+              button.danger {
+                background: #ef4444;
+              }
+
+              input {
+                width: calc(100% - 26px);
+                border-radius: 12px;
+                padding: 12px;
+                background: #020617;
+                color: white;
+                border: 1px solid #334155;
+              }
+
+              pre {
+                height: 370px;
+                overflow: auto;
+                background: #020617;
+                color: #d1fae5;
+                border-radius: 14px;
+                padding: 14px;
+                border: 1px solid #1f2937;
+                white-space: pre-wrap;
+              }
+
+              code {
+                background: #020617;
+                color: #67e8f9;
+                padding: 4px 7px;
+                border-radius: 7px;
+                word-break: break-all;
+              }
+
+              .warn {
+                color: #fde68a;
+              }
+
+              @media(max-width: 850px) {
+                .wrap {
+                  grid-template-columns: 1fr;
+                }
+
+                h1 {
+                  font-size: 34px;
+                }
+              }
+            </style>
+          </head>
+          <body>
+            <header>
+              <h1>⚡ Axtolix Host</h1>
+              <div class="sub">Free 1GB Minecraft Hosting Demo ohne Tunnel-Account</div>
+            </header>
+
+            <main class="wrap">
+              <section class="card">
+                <h2>Server</h2>
+                <p><b>Name:</b> ${SERVER_NAME}</p>
+                <p><b>Status:</b> <span id="status" class="pill">${status}</span></p>
+                <p><b>RAM:</b> ${RAM_MB} MB</p>
+                <p><b>Max Spieler:</b> ${MAX_PLAYERS}</p>
+                <p><b>Panel-Adresse:</b><br><code>${panelAddress}</code></p>
+                <p><b>Minecraft-Adresse:</b><br><code>${mcAddress}</code></p>
+              </section>
+
+              <section class="card">
+                <h2>Steuerung</h2>
+                <button class="ok" onclick="action('/api/start')">Start</button>
+                <button onclick="action('/api/restart')">Restart</button>
+                <button class="danger" onclick="action('/api/stop')">Stop</button>
+                <p class="warn">Nach maximal 6 Stunden beendet GitHub Actions den Server automatisch.</p>
+                <p>Danach musst du den Workflow wieder manuell starten.</p>
+              </section>
+
+              <section class="card big">
+                <h2>Konsole</h2>
+                <input id="cmd" placeholder="Befehl ohne /, z.B. say Willkommen bei Axtolix Host">
+                <button onclick="sendCmd()">Befehl senden</button>
+                <pre id="logs">Lade Logs...</pre>
+              </section>
+
+              <section class="card big">
+                <h2>Support</h2>
+                <p>Das ist ein Ein-Datei-Hoster für GitHub Actions. Echte dauerhafte Accounts, Welten-Speicher und mehrere Nutzer-Server brauchen später eine Datenbank und echten VPS-Speicher.</p>
+                <p>Diese Version hat Admin-Login fürs Panel, Start/Stop/Restart, Konsole, Logs und eine öffentliche Minecraft-Adresse über bore.pub.</p>
+              </section>
+            </main>
+
+            <script>
+              async function refresh() {
+                const s = await fetch('/api/status').then(r => r.json());
+                document.getElementById('status').textContent = s.status;
+
+                const l = await fetch('/api/logs').then(r => r.text());
+                const box = document.getElementById('logs');
+                box.textContent = l;
+                box.scrollTop = box.scrollHeight;
+              }
+
+              async function action(url) {
+                await fetch(url, { method: 'POST' });
+                setTimeout(refresh, 800);
+              }
+
+              async function sendCmd() {
+                const input = document.getElementById('cmd');
+                const cmd = input.value.trim();
+                if (!cmd) return;
+
+                await fetch('/api/command', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'text/plain' },
+                  body: cmd
+                });
+
+                input.value = '';
+                setTimeout(refresh, 500);
+              }
+
+              setInterval(refresh, 2500);
+              refresh();
+            </script>
+          </body>
+          </html>`;
+          }
+
+          const server = http.createServer(async (req, res) => {
+            if (!auth(req, res)) return;
+
+            if (req.method === "GET" && req.url === "/") {
+              res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+              res.end(page());
+              return;
+            }
+
+            if (req.method === "GET" && req.url === "/api/status") {
+              json(res, {
+                status,
+                panel: getPanelAddress(),
+                minecraft: getMcAddress(),
+                lastExit
+              });
+              return;
+            }
+
+            if (req.method === "GET" && req.url === "/api/logs") {
+              res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+              res.end(logs.join("\n"));
+              return;
+            }
+
+            if (req.method === "POST" && req.url === "/api/start") {
+              startMinecraft();
+              json(res, { ok: true });
+              return;
+            }
+
+            if (req.method === "POST" && req.url === "/api/stop") {
+              stopMinecraft();
+              json(res, { ok: true });
+              return;
+            }
+
+            if (req.method === "POST" && req.url === "/api/restart") {
+              restartMinecraft();
+              json(res, { ok: true });
+              return;
+            }
+
+            if (req.method === "POST" && req.url === "/api/command") {
+              const cmd = (await body(req)).trim();
+              if (cmd) sendCommand(cmd);
+              json(res, { ok: true });
+              return;
+            }
+
+            res.writeHead(404);
+            res.end("Not found");
+          });
+
+          server.listen(PANEL_PORT, () => {
+            addLog("Axtolix Panel läuft lokal auf Port " + PANEL_PORT);
+            startMinecraft();
+          });
+          NODE
+
+          echo "Starte Panel..."
+          nohup node panel/server.js > panel.log 2>&1 &
+
+          sleep 8
+
+          echo "Starte bore TCP-Tunnel fürs Panel..."
+          nohup docker run --rm --network host ekzhang/bore local "$PANEL_PORT" --to bore.pub > panel_bore.log 2>&1 &
+
+          echo "Starte bore TCP-Tunnel für Minecraft..."
+          nohup docker run --rm --network host ekzhang/bore local "$MC_PORT" --to bore.pub > mc_bore.log 2>&1 &
+
+          echo "Warte auf öffentliche Tunnel-Adressen..."
+          sleep 15
+
+          PANEL_ADDR="$(grep -oE 'bore\.pub:[0-9]+' panel_bore.log | head -n1 || true)"
+          MC_ADDR="$(grep -oE 'bore\.pub:[0-9]+' mc_bore.log | head -n1 || true)"
+
+          if [ -z "$PANEL_ADDR" ]; then
+            echo "Panel-Adresse konnte noch nicht gelesen werden. Panel bore log:"
+            cat panel_bore.log || true
+            PANEL_ADDR="Noch nicht bereit. Siehe panel_bore.log"
+          fi
+
+          if [ -z "$MC_ADDR" ]; then
+            echo "Minecraft-Adresse konnte noch nicht gelesen werden. Minecraft bore log:"
+            cat mc_bore.log || true
+            MC_ADDR="Noch nicht bereit. Siehe mc_bore.log"
+          fi
+
+          echo "$PANEL_ADDR" > panel/panel_address.txt
+          echo "$MC_ADDR" > panel/mc_address.txt
+
+          echo ""
+          echo "======================================"
+          echo "        AXTOLIX HOST IST ONLINE"
+          echo "======================================"
+          echo ""
+          echo "Panel:"
+          echo "http://$PANEL_ADDR"
+          echo ""
+          echo "Panel Login:"
+          echo "Benutzer: admin"
+          echo "Passwort: $PANEL_PASSWORD"
+          echo ""
+          echo "Minecraft Join-Adresse:"
+          echo "$MC_ADDR"
+          echo ""
+          echo "Beispiel in Minecraft:"
+          echo "Serveradresse: $MC_ADDR"
+          echo ""
+          echo "Laufzeit: maximal 6 Stunden"
+          echo "======================================"
+          echo ""
+
+          while true; do
+            sleep 60
+            echo ""
+            echo "----- Axtolix Heartbeat $(date) -----"
+            echo "Panel: http://$(cat panel/panel_address.txt)"
+            echo "Minecraft: $(cat panel/mc_address.txt)"
+            echo "Status:"
+            tail -n 25 panel.log || true
+          done
