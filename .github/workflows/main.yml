@@ -8,7 +8,7 @@ on:
         required: true
         default: "Axtolix Free Server"
       mc_version:
-        description: "Minecraft/Paper Version, z.B. 1.21.4 oder latest"
+        description: "Minecraft/Paper Version, z.B. latest oder 1.21.4"
         required: true
         default: "latest"
       max_players:
@@ -74,7 +74,7 @@ jobs:
             MC_VERSION="$MC_VERSION_INPUT"
           fi
 
-          BUILD="$(curl -fsSL "https://api.papermc.io/v2/projects/paper/versions/${MC_VERSION}" | jq -r '.builds[-1]')"
+          BUILD="$(curl -fsSL "https://api.papermc.io/v2/projects/paper/versions/${MC_VERSION}" | jq -r '.builds[-1]' || true)"
 
           if [ "$BUILD" = "null" ] || [ -z "$BUILD" ]; then
             echo "Version $MC_VERSION nicht gefunden. Fallback auf aktuelle Paper-Version."
@@ -113,6 +113,8 @@ jobs:
 
           const PANEL_PORT = Number(process.env.PANEL_PORT || 8080);
           const MC_DIR = path.join(process.cwd(), "mc");
+          const DATA_DIR = __dirname;
+
           const RAM_MB = process.env.RAM_MB || "1024";
           const USER = process.env.PANEL_USER || "admin";
           const PASS = process.env.PANEL_PASSWORD || "admin";
@@ -124,6 +126,7 @@ jobs:
           let status = "stopped";
           let logs = [];
           let lastExit = null;
+          let didOp = false;
 
           function addLog(line) {
             const text = `[${new Date().toLocaleTimeString()}] ${line}`;
@@ -134,7 +137,10 @@ jobs:
 
           function readPublicAddress(file) {
             try {
-              if (fs.existsSync(file)) return fs.readFileSync(file, "utf8").trim();
+              const fullPath = path.join(DATA_DIR, file);
+              if (fs.existsSync(fullPath)) {
+                return fs.readFileSync(fullPath, "utf8").trim();
+              }
             } catch {}
             return "wird gleich in den GitHub-Actions-Logs angezeigt";
           }
@@ -154,6 +160,7 @@ jobs:
 
             addLog("Starte Minecraft Server mit " + RAM_MB + " MB RAM...");
             status = "starting";
+            didOp = false;
 
             mc = spawn("java", [
               "-Xms512M",
@@ -169,13 +176,15 @@ jobs:
             mc.stdout.on("data", d => {
               d.toString().split(/\r?\n/).filter(Boolean).forEach(line => {
                 addLog(line);
+
                 if (line.includes("Done")) {
                   status = "online";
 
-                  if (OPERATOR_NAME && OPERATOR_NAME.trim().length > 0) {
+                  if (!didOp && OPERATOR_NAME && OPERATOR_NAME.trim().length > 0) {
                     try {
                       mc.stdin.write("op " + OPERATOR_NAME.trim() + "\n");
                       addLog("OP gesetzt für: " + OPERATOR_NAME.trim());
+                      didOp = true;
                     } catch {}
                   }
                 }
@@ -545,21 +554,31 @@ jobs:
           nohup docker run --rm --network host ekzhang/bore local "$MC_PORT" --to bore.pub > mc_bore.log 2>&1 &
 
           echo "Warte auf öffentliche Tunnel-Adressen..."
-          sleep 15
 
-          PANEL_ADDR="$(grep -oE 'bore\.pub:[0-9]+' panel_bore.log | head -n1 || true)"
-          MC_ADDR="$(grep -oE 'bore\.pub:[0-9]+' mc_bore.log | head -n1 || true)"
+          PANEL_ADDR=""
+          MC_ADDR=""
+
+          for i in {1..60}; do
+            PANEL_ADDR="$(grep -oE 'bore\.pub:[0-9]+' panel_bore.log | head -n1 || true)"
+            MC_ADDR="$(grep -oE 'bore\.pub:[0-9]+' mc_bore.log | head -n1 || true)"
+
+            if [ -n "$PANEL_ADDR" ] && [ -n "$MC_ADDR" ]; then
+              break
+            fi
+
+            sleep 2
+          done
 
           if [ -z "$PANEL_ADDR" ]; then
-            echo "Panel-Adresse konnte noch nicht gelesen werden. Panel bore log:"
+            echo "Panel-Adresse konnte nicht gelesen werden. Panel bore log:"
             cat panel_bore.log || true
-            PANEL_ADDR="Noch nicht bereit. Siehe panel_bore.log"
+            PANEL_ADDR="Noch nicht bereit. Siehe GitHub-Actions-Log."
           fi
 
           if [ -z "$MC_ADDR" ]; then
-            echo "Minecraft-Adresse konnte noch nicht gelesen werden. Minecraft bore log:"
+            echo "Minecraft-Adresse konnte nicht gelesen werden. Minecraft bore log:"
             cat mc_bore.log || true
-            MC_ADDR="Noch nicht bereit. Siehe mc_bore.log"
+            MC_ADDR="Noch nicht bereit. Siehe GitHub-Actions-Log."
           fi
 
           echo "$PANEL_ADDR" > panel/panel_address.txt
